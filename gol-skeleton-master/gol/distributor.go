@@ -47,38 +47,52 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}
 
-	// A new world to store new state
-	newWorld := make([][]byte, p.ImageWidth)
-	for i := 0; i < p.ImageHeight; i++ {
-		newWorld[i] = make([]byte, p.ImageHeight)
-	}
+	//A new world to store new state
+	//newWorld := make([][]byte, p.ImageWidth)
+	//for i := 0; i < p.ImageHeight; i++ {
+	//	newWorld[i] = make([]byte, p.ImageHeight)
+	//}
 
-	//worldHeight := len(world)
+	worldHeight := len(world)
+
 	turn := 0
 	for ; turn < p.Turns; turn++ {
 		if p.Threads == 1 {
 			world = CalculateNextState(world, p)
 		} else {
+			newWorld := make([][]byte, 0)
 			threads := p.Threads
-
+			workerHeight := worldHeight / p.Threads
+			workerSlice := make([]int, p.Threads)
+			num := 1
+			for i := 0; i < p.Threads; i++ {
+				workerSlice[i] = workerHeight * num
+				num++
+			}
 			channels := make([]chan [][]byte, p.Threads)
 			for i := range channels {
-				channels[i] = make(chan [][]byte)
+				channels[i] = make(chan [][]byte, workerHeight*w)
 			}
-			//workerHeight := worldHeight / p.Threads
-			i := 0
-			for ; i < threads-1; i++ {
-				go worker(world, p, channels[i])
+
+			for i := 0; i < threads; i++ {
+				go worker(world, p, workerSlice[i-1], workerSlice[i], channels[i])
+				if i == 0 {
+					go worker(world, p, 0, workerSlice[i], channels[i])
+				} else {
+					if i == threads-1 {
+						go worker(world, p, workerSlice[i-1], worldHeight, channels[i])
+					}
+				}
 			}
-			go worker(world, p, channels[i])
 			for i := 0; i < threads; i++ {
 				newWorld = append(newWorld, <-channels[i]...)
 			}
+			//fmt.Println(len(newWorld))
 			world = newWorld
 		}
 
 		// TODO: Report the final state using FinalTurnCompleteEvent.
-	} //这个步骤什么意思
+	}
 
 	alive := calculateAliveCells(world)
 	finalTurn := FinalTurnComplete{CompletedTurns: turn, Alive: alive}
@@ -154,7 +168,13 @@ func CalculateNextState(world [][]byte, p Params) [][]byte {
 
 	return newState
 }
-func worker(world [][]byte, p Params, out chan<- [][]byte) {
-	partialWorld := CalculateNextState(world, p)
+
+func worker(world [][]byte, p Params, start int, end int, out chan<- [][]byte) {
+	workerHeight := end - start
+	partialWorld := make([][]byte, workerHeight) //each workerWorld
+	for j := range partialWorld {
+		partialWorld[j] = make([]byte, p.ImageWidth)
+	}
+	partialWorld = CalculateNextState(world, p)
 	out <- partialWorld
 }

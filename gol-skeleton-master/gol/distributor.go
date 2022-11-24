@@ -1,7 +1,9 @@
 package gol
 
 import (
-	"strconv"
+	"fmt"
+	"github.com/veandco/go-sdl2/sdl"
+	"time"
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
@@ -14,25 +16,25 @@ type distributorChannels struct {
 	ioInput    <-chan uint8
 }
 
-func calculateAliveCells(world [][]byte) []util.Cell {
-	cells := make([]util.Cell, 0)
-	for i := range world {
-		for j := range world[i] {
-			if world[i][j] == 255 {
-				cells = append(cells, util.Cell{j, i})
-			}
-		}
-	}
-	return cells
-}
+const (
+	noAction    = 0
+	pause       = 1
+	save        = 2
+	quitAndSave = 3
+)
 
 // distributor divides the work between workers and interacts with other goroutines.
-func distributor(p Params, c distributorChannels) {
+func distributor(p Params, c distributorChannels, keyPresses <-chan rune) {
 	h := p.ImageHeight
 	w := p.ImageWidth
-	filename := strconv.Itoa(w) + "x" + strconv.Itoa(h) //input filename???
 	c.ioCommand <- ioInput
+	//filename := strconv.Itoa(w) + "x" + strconv.Itoa(h) //input filename???
+	filename := fmt.Sprintf("%dx%d", h, w)
 	c.ioFilename <- filename
+
+	actionChannel := make(chan int)
+	resumeChannel := make(chan bool)
+	turnChannel := make(chan int)
 
 	// TODO: Create a 2D slice to store the world.
 	//old world for the original state
@@ -44,6 +46,13 @@ func distributor(p Params, c distributorChannels) {
 	for i := 0; i < p.ImageHeight; i++ {
 		for j := 0; j < p.ImageWidth; j++ {
 			world[i][j] = <-c.ioInput
+
+			if world[i][j] == 1 {
+				c.events <- CellFlipped{
+					Cell:           util.Cell{j, i},
+					CompletedTurns: 0,
+				}
+			}
 		}
 	}
 
@@ -56,57 +65,172 @@ func distributor(p Params, c distributorChannels) {
 	worldHeight := len(world)
 
 	turn := 0
+	ticker := time.Tick(2 * time.Second)
+	go dealWithKey(keyPresses, turnChannel, actionChannel, resumeChannel)
+
 	for ; turn < p.Turns; turn++ {
 		if p.Threads == 1 {
-			world = CalculateNextState(world, p)
 		} else {
 			newWorld := make([][]byte, 0)
 			threads := p.Threads
 			workerHeight := worldHeight / p.Threads
-			workerSlice := make([]int, p.Threads)
-			num := 1
-			for i := 0; i < p.Threads; i++ {
-				workerSlice[i] = workerHeight * num
-				num++
-			}
 			channels := make([]chan [][]byte, p.Threads)
-			for i := range channels {
-				channels[i] = make(chan [][]byte, workerHeight*w)
-			}
+			// for i := range channels {
+			// 	channels[i] = make(chan [][]byte, workerHeight*w)
+			// }
 
-			for i := 0; i < threads; i++ {
-				go worker(world, p, workerSlice[i-1], workerSlice[i], channels[i])
-				if i == 0 {
-					go worker(world, p, 0, workerSlice[i], channels[i])
-				} else {
-					if i == threads-1 {
-						go worker(world, p, workerSlice[i-1], worldHeight, channels[i])
-					}
-				}
+			i := 0
+			for ; i < threads-1; i++ {
+				channels[i] = make(chan [][]byte, workerHeight*w)
+				go worker(world, p, i*workerHeight, (i+1)*workerHeight, channels[i], c, turn)
 			}
+			last_height := worldHeight - i*workerHeight
+			channels[i] = make(chan [][]byte, last_height*w)
+			go worker(world, p, i*workerHeight, worldHeight, channels[i], c, turn)
 			for i := 0; i < threads; i++ {
 				newWorld = append(newWorld, <-channels[i]...)
 			}
-			//fmt.Println(len(newWorld))
+
+			requestedAction := actOrReturn(actionChannel)
+			resume := true
+			if requestedAction == pause || requestedAction == save {
+				turnChannel <- turn
+				resume = <-resumeChannel
+			}
+			if requestedAction == quitAndSave || resume == false {
+				quit(world, c, filename, turn)
+			}
+
+			if turn == p.Turns {
+				quit(world, c, filename, turn)
+			}
+
+			func quit(world [][]byte, c distributorChannels, filename string, turn int) {
+				alive := calculateAliveCells(world)
+				finalTurn := FinalTurnComplete{CompletedTurns: turn, Alive: alive}
+			}
+
+				reportAliveCells(world, ticker, c, turn)
+			world = CalculateNextState(world, 0, worldHeight, p)
+			complete := TurnComplete{CompletedTurns: turn}
+			c.events <- complete
+			finalTurn := FinalTurnComplete{CompletedTurns: turn, Alive: alive}
+
+			c.events <- finalTurn
+
+			func reportAliveCells(world[][]byte, ticker<-chan time.Time, c distributorChannels, turn int) {
+				//	select {
+				//	case <-ticker:
+				//		aliveCells := len(calculateAliveCells(world))
+				//
+				//		c.events <- AliveCellsCount{
+				//			CellsCount:     aliveCells,
+				//			CompletedTurns: turn,
+				//		}
+				//	default:
+				//		return
+				//	}
+				//}
+				actOnAction := actOrReturn(action)
+				switch actOnAction {
+				case 1:
+					turnChannel <- turn
+					<-resumeChannel
+				}
+			}
 			world = newWorld
+			complete := TurnComplete{CompletedTurns: turn}
+			c.events <- complete
+			//fmt.Println(len(newWorld))
+
 		}
 
 		// TODO: Report the final state using FinalTurnCompleteEvent.
 	}
+	if turn == p.Turns {
+		alive := calculateAliveCells(world)
 
-	alive := calculateAliveCells(world)
-	finalTurn := FinalTurnComplete{CompletedTurns: turn, Alive: alive}
+		// Make sure that the Io has finished any output before exiting.
 
-	c.events <- finalTurn
-	// Make sure that the Io has finished any output before exiting.
+		c.ioCommand <- ioOutput
+		filename = filename + fmt.Sprintf("x%v", turn)
+		c.ioFilename <- filename
+		for i := range world {
+			for j := range world[i] {
+				c.ioOutput <- world[i][j]
+			}
+		}
+		c.ioCommand <- ioCheckIdle
+		<-c.ioIdle
+
+		c.events <- StateChange{turn, Quitting}
+
+		// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
+		close(c.events)
+	}
+}
+func actOrReturn(action chan int) int {
+	select {
+	case <-action:
+		return 1
+	default:
+		return 0
+	}
+}
+func quit(c distributorChannels) {
 	c.ioCommand <- ioCheckIdle
 	<-c.ioIdle
-
-	c.events <- StateChange{turn, Quitting}
-
-	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
 	close(c.events)
 }
+func screenShot(world [][]byte, c distributorChannels, filename string, turn int) {
+	c.ioCommand <- ioOutput
+	filename = filename + fmt.Sprintf("x%v", turn)
+	c.ioFilename <- filename
+}
+func dealWithKey(turn int, c distributorChannels, keyPresses <-chan rune, world [][]byte, filename string, turnRequest, action chan int, returned chan bool) {
+	for {
+		select {
+		case key := <-keyPresses:
+			switch key {
+			case sdl.K_q:
+				quit(c)
+				returned <- false
+			case sdl.K_s:
+				screenShot(world, c, filename, turn)
+				quit(c)
+				action <- 0
+				returned <- false
+			case sdl.K_p:
+				action <- 1
+				fmt.Println(<-turnRequest)
+				pKey(turn, c, keyPresses, world, filename, action, returned)
+			}
+		}
+	}
+}
+func pKey(turn int, c distributorChannels, keyPresses <-chan rune, world [][]byte, filename string, action chan int, returned chan bool) {
+	select {
+	case key := <-keyPresses:
+		switch key {
+		case sdl.K_q:
+			quit(c)
+			//action <-0
+			returned <- false
+		case sdl.K_s:
+			screenShot(world, c, filename, turn)
+			quit(c)
+			//action <-0
+			returned <- false
+		case sdl.K_p:
+			fmt.Println("Continuing")
+			//action <-0
+			returned <- true
+		}
+	}
+}
+
+
+
 
 // TODO: Execute all turns of the Game of Life.
 // Iterate gameoflife algorithm --- using for loop
@@ -143,38 +267,69 @@ func CalculateAroundNeighbours(x int, y int, p Params, world [][]byte) int { //A
 	return neighbours
 }
 
-func CalculateNextState(world [][]byte, p Params) [][]byte {
+func getNewState(x int, y int, p Params, world [][]byte, c distributorChannels, turn int) byte {
 	const dead, alive = 0, 255
-	newState := make([][]byte, p.ImageWidth)
-	for i := 0; i < p.ImageHeight; i++ {
-		newState[i] = make([]byte, p.ImageWidth)
-	}
-	for y := 0; y < p.ImageHeight; y++ {
-		for x := 0; x < p.ImageWidth; x++ {
-			state := world[y][x]
-			neighbour := CalculateAroundNeighbours(x, y, p, world)
-			if state == alive && neighbour < 2 {
-				newState[y][x] = dead
-			} else if (state == alive && neighbour == 2) || (state == 255 && neighbour == 3) {
-				newState[y][x] = alive
-			} else if state == alive && neighbour > 3 {
-				newState[y][x] = dead
-			} else if state == dead && neighbour == 3 {
-				newState[y][x] = alive
+	state := getStateValue(x, y, p, world)
+	neighbour := CalculateAroundNeighbours(x, y, p, world)
+	if state == 1 && neighbour < 2 {
+		c.events <- CellFlipped{
+			Cell:           util.Cell{X: y, Y: x},
+			CompletedTurns: turn,
+		}
+		return dead
+	} else if (state == 1 && neighbour == 2) || (state == 1 && neighbour == 3) {
+		return alive
+	} else if state == 1 && neighbour > 3 {
+		c.events <- CellFlipped{
+			Cell:           util.Cell{X: y, Y: x},
+			CompletedTurns: turn,
+		}
+		return dead
+	} else if state == 0 && neighbour == 3 {
+		c.events <- CellFlipped{
+			Cell:           util.Cell{X: y, Y: x},
+			CompletedTurns: turn,
+		}
+		return alive
 
-			}
+	} else {
+		return dead
+	}
+
+}
+func CalculateNextState(world [][]byte, startY, endY int, p Params, c distributorChannels, turn int) [][]byte {
+	height := endY - startY
+	newState := make([][]byte, height)
+	// for i := range height {
+	// 	newState[i] = make([]byte, p.ImageWidth)
+	// 	// for j := range newState {
+	// 	// 	newState[i][j] = world[i+startY][j]
+	// 	// }
+	// }
+	for y := 0; y < height; y++ {
+		newState[y] = make([]byte, p.ImageWidth)
+		for x := 0; x < p.ImageWidth; x++ {
+			state := getNewState(x, y+startY, p, world, c, turn)
+			newState[y][x] = state
 		}
 	}
 
 	return newState
 }
 
-func worker(world [][]byte, p Params, start int, end int, out chan<- [][]byte) {
-	workerHeight := end - start
-	partialWorld := make([][]byte, workerHeight) //each workerWorld
-	for j := range partialWorld {
-		partialWorld[j] = make([]byte, p.ImageWidth)
-	}
-	partialWorld = CalculateNextState(world, p)
+func worker(world [][]byte, p Params, startY, endY int, out chan<- [][]byte, c distributorChannels, turn int) {
+	partialWorld := CalculateNextState(world, startY, endY,p, c, turn)
 	out <- partialWorld
+}
+
+func calculateAliveCells(world [][]byte) []util.Cell {
+	cells := make([]util.Cell, 0)
+	for i := range world {
+		for j := range world[i] {
+			if world[i][j] == 255 {
+				cells = append(cells, util.Cell{j, i})
+			}
+		}
+	}
+	return cells
 }
